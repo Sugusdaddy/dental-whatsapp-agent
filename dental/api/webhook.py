@@ -41,6 +41,19 @@ app = FastAPI(
     version     = "1.0.0",
 )
 
+# Incluir routers de módulos adicionales
+try:
+    from dental.core.onboarding import router as onboarding_router
+    app.include_router(onboarding_router)
+except ImportError:
+    logger.warning("Onboarding router not available")
+
+try:
+    from dental.core.billing import router as billing_router
+    app.include_router(billing_router)
+except ImportError:
+    logger.warning("Billing router not available")
+
 # CORS para dashboard
 app.add_middleware(
     CORSMiddleware,
