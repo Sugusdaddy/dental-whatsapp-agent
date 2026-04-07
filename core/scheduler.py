@@ -72,42 +72,8 @@ def build_weekly_report(
 # ENVÍO — stub reemplazable por 360dialog
 # ─────────────────────────────────────────────
 
-async def send_whatsapp(to: str, text: str, clinic_id: str) -> bool:
-    """
-    Envía mensaje de WhatsApp.
-    En producción: POST a https://waba.360dialog.io/v1/messages
-    """
-    import os, httpx
-
-    api_key = os.getenv("DIALOG360_API_KEY")
-    if not api_key:
-        # Dev mode — solo log
-        logger.info(f"[DEV] WhatsApp → {to}: {text[:60]}...")
-        return True
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                "https://waba.360dialog.io/v1/messages",
-                headers={
-                    "D360-API-KEY": api_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to":   to,
-                    "type": "text",
-                    "text": {"body": text},
-                },
-            )
-            if r.status_code == 200:
-                logger.info(f"✓ WhatsApp enviado a {to}")
-                return True
-            logger.error(f"✗ Error 360dialog {r.status_code}: {r.text[:100]}")
-            return False
-    except Exception as e:
-        logger.error(f"✗ Excepción enviando WhatsApp: {e}")
-        return False
+# Importar cliente WhatsApp centralizado
+from dental.core.whatsapp_client import send_whatsapp
 
 
 # ─────────────────────────────────────────────
