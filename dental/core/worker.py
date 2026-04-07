@@ -18,6 +18,12 @@ from typing import Optional
 
 from celery import Celery
 
+# Re-exported at module level so tests (and callers) can patch
+# `dental.core.worker.get_db` / `send_whatsapp` / `process_message` directly.
+from dental.core.database import get_db  # noqa: E402
+from dental.core.whatsapp_client import send_whatsapp  # noqa: E402
+from dental.core.agent import process_message  # noqa: E402
+
 logger = logging.getLogger("dental.worker")
 
 # ─────────────────────────────────────────────
@@ -74,9 +80,6 @@ def process_whatsapp_message(
     3. Guarda el historial de conversación
     """
     import asyncio
-    from dental.core.agent import process_message
-    from dental.core.database import get_db
-    from dental.core.whatsapp_client import send_whatsapp
 
     logger.info(f"[{clinic_id}] Procesando mensaje de {patient_phone}: {message_text[:50]}...")
 
@@ -87,11 +90,9 @@ def process_whatsapp_message(
         logger.error(f"Clínica {clinic_id} no encontrada")
         return {"status": "error", "error": "clinic_not_found"}
 
-    # Verificar si hay takeover humano (el dentista tomó control)
-    # En producción: consultar flag en DB
-    human_takeover = False  # TODO: db.get_conversation_takeover(clinic_id, patient_phone)
-    if human_takeover:
-        logger.info(f"[{clinic_id}] Conversación con {patient_phone} en modo humano - ignorando")
+    # Verificar si el dentista tomó control de la conversación
+    if db.is_human_takeover(clinic_id, patient_phone):
+        logger.info(f"[{clinic_id}] Takeover activo para {patient_phone} — agente silenciado")
         return {"status": "skipped", "reason": "human_takeover"}
 
     # Procesar con el agente
@@ -142,8 +143,6 @@ def send_scheduled_reminder(
     Llamado por el scheduler.
     """
     import asyncio
-    from dental.core.database import get_db
-    from dental.core.whatsapp_client import send_whatsapp
     from dental.core.scheduler import build_reminder_48h, build_reminder_2h
 
     db = get_db()
@@ -198,8 +197,6 @@ def send_weekly_report(clinic_id: str):
     import asyncio
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
-    from dental.core.database import get_db
-    from dental.core.whatsapp_client import send_whatsapp
     from dental.core.scheduler import build_weekly_report
     from dental.core.models import AppointmentStatus
 

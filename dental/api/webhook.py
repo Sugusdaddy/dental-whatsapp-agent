@@ -41,27 +41,78 @@ app = FastAPI(
     version     = "1.0.0",
 )
 
-# Incluir routers de módulos adicionales
+# ─────────────────────────────────────────────
+# INCLUIR ROUTERS ANTES DEL MIDDLEWARE
+# ─────────────────────────────────────────────
+
+try:
+    from dental.core.auth import router as auth_router
+    app.include_router(auth_router)
+    logger.info("Auth router loaded")
+except ImportError as e:
+    logger.warning(f"Auth router not available: {e}")
+
 try:
     from dental.core.onboarding import router as onboarding_router
     app.include_router(onboarding_router)
-except ImportError:
-    logger.warning("Onboarding router not available")
+    logger.info("Onboarding router loaded")
+except ImportError as e:
+    logger.warning(f"Onboarding router not available: {e}")
 
 try:
     from dental.core.billing import router as billing_router
     app.include_router(billing_router)
-except ImportError:
-    logger.warning("Billing router not available")
+    logger.info("Billing router loaded")
+except ImportError as e:
+    logger.warning(f"Billing router not available: {e}")
 
-# CORS para dashboard
+# ─────────────────────────────────────────────
+# CORS MIDDLEWARE (después de routers)
+# ─────────────────────────────────────────────
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción: restringir a dominio del dashboard
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─────────────────────────────────────────────
+# IN-MEMORY EVENT LOG (ring buffer, max 500)
+# ─────────────────────────────────────────────
+# Para debug en producción. Ojo: se pierde al reiniciar el proceso —
+# para persistir hace falta una tabla `events` en Postgres y migrar.
+# Suficiente para los primeros pilotos.
+
+from collections import deque
+from threading import Lock
+
+_event_log: deque = deque(maxlen=500)
+_event_log_lock = Lock()
+
+
+def log_event(
+    *,
+    clinic_id: str,
+    type: str,            # message_in | message_out | takeover_on | takeover_off | error | action
+    summary: str,
+    phone: Optional[str] = None,
+    level: str = "info",  # info | warn | error
+    extra: Optional[dict] = None,
+) -> None:
+    """Registra un evento visible desde el dashboard /api/logs/{clinic_id}."""
+    with _event_log_lock:
+        _event_log.append({
+            "ts": datetime.now(MADRID_TZ).isoformat(),
+            "clinic_id": clinic_id,
+            "type": type,
+            "level": level,
+            "phone": phone,
+            "summary": summary[:300],  # cap por si llega un mensaje gigante
+            "extra": extra or {},
+        })
 
 WEBHOOK_SECRET = os.getenv("WHATSAPP_WEBHOOK_SECRET", "dev_secret_changeme")
 ASYNC_MODE = os.getenv("ASYNC_MODE", "false").lower() == "true"
@@ -209,10 +260,53 @@ async def receive_message(
         return JSONResponse({"status": "ignored", "reason": "no_text_message"})
 
     logger.info(f"[{clinic_id}] Mensaje de {msg['phone']}: {msg['text'][:50]}...")
+    log_event(
+        clinic_id=clinic_id,
+        type="message_in",
+        phone=msg["phone"],
+        summary=msg["text"],
+    )
+
+    # Registrar contacto del paciente (alimenta active_conversations en el dashboard)
+    try:
+        from dental.core.models import Patient
+        existing = db.get_patient(clinic_id, msg["phone"])
+        db.upsert_patient(Patient(
+            patient_id=existing.patient_id if existing else 0,
+            clinic_id=clinic_id,
+            phone=msg["phone"],
+            name=msg.get("name") or (existing.name if existing else None),
+            email=existing.email if existing else None,
+            last_visit=existing.last_visit if existing else None,
+            last_contact=datetime.now(MADRID_TZ),
+        ))
+    except Exception as e:
+        logger.warning(f"No se pudo actualizar last_contact: {e}")
 
     # Marcar como leído
     whatsapp = get_whatsapp_client()
     await whatsapp.mark_as_read(msg["message_id"])
+
+    # ═══════════════════════════════════════════
+    # HUMAN TAKEOVER: si el dentista tomó el control,
+    # NO respondemos. El mensaje queda visible en el
+    # dashboard pero el bot se mantiene en silencio.
+    # ═══════════════════════════════════════════
+    if db.is_human_takeover(clinic_id, msg["phone"]):
+        logger.info(
+            f"[{clinic_id}] Takeover activo para {msg['phone']} — agente silenciado"
+        )
+        log_event(
+            clinic_id=clinic_id,
+            type="action",
+            phone=msg["phone"],
+            summary="Mensaje recibido — agente en modo manual, no responde",
+        )
+        return JSONResponse({
+            "status": "human_handling",
+            "clinic_id": clinic_id,
+            "patient_phone": msg["phone"],
+        })
 
     # ═══════════════════════════════════════════
     # MODO ASYNC: Encolar en Celery
@@ -249,8 +343,21 @@ async def receive_message(
             clinic_id=clinic_id,
             patient_name=msg.get("name"),
         )
+        log_event(
+            clinic_id=clinic_id,
+            type="message_out",
+            phone=msg["phone"],
+            summary=response_text,
+        )
     except Exception as e:
         logger.error(f"Error en agente: {e}", exc_info=True)
+        log_event(
+            clinic_id=clinic_id,
+            type="error",
+            phone=msg["phone"],
+            level="error",
+            summary=f"Error en agente: {e}",
+        )
         response_text = (
             "Lo siento, ha ocurrido un error técnico. "
             f"Por favor llama directamente a la clínica: {clinic.phone}"
@@ -278,7 +385,7 @@ async def receive_message(
 
 @app.get("/api/stats/{clinic_id}")
 async def get_clinic_stats(clinic_id: str):
-    """Métricas del día para el dashboard del dentista."""
+    """Métricas globales de la clínica para el dashboard."""
     db = get_db()
     clinic = db.get_clinic(clinic_id)
     if not clinic:
@@ -286,25 +393,150 @@ async def get_clinic_stats(clinic_id: str):
 
     now = datetime.now(MADRID_TZ)
 
-    # Obtener citas de hoy
+    # Todas las citas de la clínica (no solo hoy — el dashboard muestra agregados)
     all_apts = [
-        a for a in db._appointments.values()
-        if a.clinic_id == clinic_id
-        and a.appointment_datetime.date() == now.date()
+        a for a in db._appointments.values() if a.clinic_id == clinic_id
+    ]
+    today_apts = [
+        a for a in all_apts if a.appointment_datetime.date() == now.date()
     ]
 
     from dental.core.models import AppointmentStatus
+
+    confirmed = sum(1 for a in all_apts if a.status == AppointmentStatus.CONFIRMED)
+    pending = sum(1 for a in all_apts if a.status == AppointmentStatus.PENDING)
+    cancelled = sum(1 for a in all_apts if a.status == AppointmentStatus.CANCELLED)
 
     return {
         "clinic_id": clinic_id,
         "clinic_name": clinic.name,
         "date": now.strftime("%Y-%m-%d"),
         "total_appointments": len(all_apts),
-        "confirmed": sum(1 for a in all_apts if a.confirmation_received),
-        "pending": sum(1 for a in all_apts if not a.confirmation_received 
-                      and a.status == AppointmentStatus.CONFIRMED),
-        "cancelled": sum(1 for a in all_apts if a.status == AppointmentStatus.CANCELLED),
+        "today_appointments": len(today_apts),
+        "confirmed": confirmed,
+        "pending": pending,
+        "cancelled": cancelled,
         "no_shows": sum(1 for a in all_apts if a.status == AppointmentStatus.NO_SHOW),
+    }
+
+
+# ─────────────────────────────────────────────
+# CLINIC DETAIL & UPDATE
+# ─────────────────────────────────────────────
+
+@app.get("/api/clinics/{clinic_id}")
+async def get_clinic_detail(clinic_id: str):
+    """Detalle completo de una clínica (para precargar la pantalla de Settings)."""
+    db = get_db()
+    clinic = db.get_clinic(clinic_id)
+    if not clinic:
+        raise HTTPException(status_code=404, detail="Clínica no encontrada")
+
+    return {
+        "clinic_id": clinic.clinic_id,
+        "name": clinic.name,
+        "address": clinic.address,
+        "phone": clinic.phone,
+        "whatsapp_number": clinic.whatsapp_number,
+        "whatsapp_connected": bool(clinic.whatsapp_number),
+        "services": [
+            {"name": s.name, "price_from": s.price_from} for s in clinic.services
+        ],
+        "insurance_accepted": clinic.insurance_accepted,
+    }
+
+
+class ClinicUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    whatsapp_number: Optional[str] = None
+
+
+@app.patch("/api/clinics/{clinic_id}")
+async def update_clinic_endpoint(clinic_id: str, payload: ClinicUpdate):
+    """Actualiza los datos editables de una clínica desde el dashboard."""
+    db = get_db()
+    if not db.get_clinic(clinic_id):
+        raise HTTPException(status_code=404, detail="Clínica no encontrada")
+
+    updated = db.update_clinic(clinic_id, payload.model_dump(exclude_none=True))
+    if not updated:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar la clínica")
+
+    logger.info(f"[{clinic_id}] Clínica actualizada: {payload.model_dump(exclude_none=True)}")
+    return {
+        "clinic_id": updated.clinic_id,
+        "name": updated.name,
+        "address": updated.address,
+        "phone": updated.phone,
+        "whatsapp_number": updated.whatsapp_number,
+    }
+
+
+# ─────────────────────────────────────────────
+# APPOINTMENTS LIST (para dashboard)
+# ─────────────────────────────────────────────
+
+@app.get("/api/appointments/{clinic_id}")
+async def list_appointments(
+    clinic_id: str,
+    status: Optional[str] = None,
+    when: str = "all",  # all | upcoming | past | today
+    limit: int = 100,
+):
+    """
+    Lista de citas para el dashboard. Soporta filtros básicos.
+
+    - status:  confirmed | pending | cancelled | no_show | completed
+    - when:    all | upcoming | past | today
+    - limit:   máximo de resultados (default 100)
+    """
+    db = get_db()
+    clinic = db.get_clinic(clinic_id)
+    if not clinic:
+        raise HTTPException(status_code=404, detail="Clínica no encontrada")
+
+    from dental.core.models import AppointmentStatus
+
+    now = datetime.now(MADRID_TZ)
+    apts = [a for a in db._appointments.values() if a.clinic_id == clinic_id]
+
+    if status:
+        try:
+            target_status = AppointmentStatus(status)
+            apts = [a for a in apts if a.status == target_status]
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Estado inválido: {status}")
+
+    if when == "upcoming":
+        apts = [a for a in apts if a.appointment_datetime >= now]
+    elif when == "past":
+        apts = [a for a in apts if a.appointment_datetime < now]
+    elif when == "today":
+        apts = [a for a in apts if a.appointment_datetime.date() == now.date()]
+
+    # Más recientes / próximas primero
+    apts.sort(key=lambda a: a.appointment_datetime, reverse=(when != "upcoming"))
+    apts = apts[:limit]
+
+    return {
+        "clinic_id": clinic_id,
+        "total": len(apts),
+        "appointments": [
+            {
+                "appointment_id": a.appointment_id,
+                "patient_phone": a.patient_phone,
+                "patient_name": a.patient_name or "Paciente",
+                "datetime": a.appointment_datetime.isoformat(),
+                "treatment": a.treatment,
+                "dentist": a.dentist,
+                "duration_min": a.duration_min,
+                "status": a.status.value,
+                "confirmation_received": a.confirmation_received,
+            }
+            for a in apts
+        ],
     }
 
 
@@ -334,47 +566,54 @@ async def get_conversations(clinic_id: str, limit: int = 20):
                 "name": apt.patient_name or (patient.name if patient else "Paciente"),
                 "last_appointment": apt.appointment_datetime.isoformat(),
                 "status": apt.status.value,
-                "human_takeover": False,
+                "human_takeover": db.is_human_takeover(clinic_id, apt.patient_phone),
             })
 
     return {"clinic_id": clinic_id, "conversations": conversations}
 
 
-@app.post("/api/conversations/{clinic_id}/{phone}/takeover")
-async def takeover_conversation(clinic_id: str, phone: str):
-    """El dentista toma control de una conversación."""
+@app.post("/api/takeover/{clinic_id}")
+async def takeover_conversation(clinic_id: str, request: Request):
+    """El dentista toma/libera control de una conversación."""
     db = get_db()
     clinic = db.get_clinic(clinic_id)
     if not clinic:
         raise HTTPException(status_code=404, detail="Clínica no encontrada")
 
-    # TODO: Guardar flag en DB
-    logger.info(f"[{clinic_id}] Takeover de conversación con {phone}")
+    data = await request.json()
+    phone = data.get("phone")
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone es obligatorio")
+    enable = bool(data.get("enable", True))
 
-    return {
-        "status": "takeover_active",
-        "clinic_id": clinic_id,
-        "phone": phone,
-        "message": "El agente ya no responderá automáticamente a este paciente.",
-    }
+    db.set_human_takeover(clinic_id, phone, enable)
 
-
-@app.post("/api/conversations/{clinic_id}/{phone}/release")
-async def release_conversation(clinic_id: str, phone: str):
-    """Devuelve el control de la conversación al agente."""
-    db = get_db()
-    clinic = db.get_clinic(clinic_id)
-    if not clinic:
-        raise HTTPException(status_code=404, detail="Clínica no encontrada")
-
-    logger.info(f"[{clinic_id}] Release de conversación con {phone}")
-
-    return {
-        "status": "agent_active",
-        "clinic_id": clinic_id,
-        "phone": phone,
-        "message": "El agente volverá a responder automáticamente.",
-    }
+    if enable:
+        logger.info(f"[{clinic_id}] Takeover ACTIVADO para {phone}")
+        log_event(
+            clinic_id=clinic_id, type="takeover_on", phone=phone,
+            summary="El dentista tomó el control de la conversación",
+        )
+        return {
+            "status": "takeover_active",
+            "clinic_id": clinic_id,
+            "phone": phone,
+            "human_takeover": True,
+            "message": "El agente ya no responderá automáticamente a este paciente.",
+        }
+    else:
+        logger.info(f"[{clinic_id}] Takeover DESACTIVADO para {phone}")
+        log_event(
+            clinic_id=clinic_id, type="takeover_off", phone=phone,
+            summary="El dentista devolvió la conversación al agente",
+        )
+        return {
+            "status": "agent_active",
+            "clinic_id": clinic_id,
+            "phone": phone,
+            "human_takeover": False,
+            "message": "El agente volverá a responder automáticamente.",
+        }
 
 
 # ─────────────────────────────────────────────
@@ -394,6 +633,99 @@ async def get_task_status(task_id: str):
         "task_id": task_id,
         "status": result.status,
         "result": result.result if result.ready() else None,
+    }
+
+
+# ─────────────────────────────────────────────
+# APPOINTMENT ACTIONS (confirmar/cancelar desde dashboard)
+# ─────────────────────────────────────────────
+
+class CancelPayload(BaseModel):
+    reason: Optional[str] = ""
+
+
+@app.post("/api/appointments/{appointment_id}/confirm")
+async def confirm_appointment_endpoint(appointment_id: str):
+    """Marca una cita como confirmada por el dentista desde el dashboard."""
+    db = get_db()
+    apt = db.get_appointment(appointment_id)
+    if not apt:
+        raise HTTPException(status_code=404, detail="Cita no encontrada")
+
+    updated = db.confirm_appointment(appointment_id)
+    log_event(
+        clinic_id=apt.clinic_id,
+        type="action",
+        phone=apt.patient_phone,
+        summary=f"Cita {appointment_id} confirmada manualmente",
+    )
+    return {
+        "appointment_id": appointment_id,
+        "status": updated.status.value if updated else "unknown",
+        "confirmation_received": updated.confirmation_received if updated else False,
+    }
+
+
+@app.post("/api/appointments/{appointment_id}/cancel")
+async def cancel_appointment_endpoint(appointment_id: str, payload: CancelPayload):
+    """Cancela una cita desde el dashboard."""
+    db = get_db()
+    apt = db.get_appointment(appointment_id)
+    if not apt:
+        raise HTTPException(status_code=404, detail="Cita no encontrada")
+
+    updated = db.cancel_appointment(appointment_id, payload.reason or "")
+    log_event(
+        clinic_id=apt.clinic_id,
+        type="action",
+        phone=apt.patient_phone,
+        summary=f"Cita {appointment_id} cancelada manualmente: {payload.reason or '(sin motivo)'}",
+    )
+    return {
+        "appointment_id": appointment_id,
+        "status": updated.status.value if updated else "unknown",
+        "reason": payload.reason or "",
+    }
+
+
+# ─────────────────────────────────────────────
+# EVENT LOGS (debug en producción)
+# ─────────────────────────────────────────────
+
+@app.get("/api/logs/{clinic_id}")
+async def get_logs(
+    clinic_id: str,
+    limit: int = 100,
+    type: Optional[str] = None,
+    level: Optional[str] = None,
+):
+    """
+    Devuelve los eventos recientes del agente para una clínica.
+
+    El log es un ring buffer en memoria (max 500 eventos globales).
+    Se pierde al reiniciar el proceso. Para auditoría persistente
+    hace falta migrar a una tabla en Postgres.
+    """
+    db = get_db()
+    if not db.get_clinic(clinic_id):
+        raise HTTPException(status_code=404, detail="Clínica no encontrada")
+
+    with _event_log_lock:
+        events = list(_event_log)
+
+    # Filtrar por clínica + filtros opcionales
+    events = [e for e in events if e["clinic_id"] == clinic_id]
+    if type:
+        events = [e for e in events if e["type"] == type]
+    if level:
+        events = [e for e in events if e["level"] == level]
+
+    # Más recientes primero
+    events.reverse()
+    return {
+        "clinic_id": clinic_id,
+        "total": len(events),
+        "events": events[:limit],
     }
 
 

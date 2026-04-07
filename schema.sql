@@ -78,6 +78,16 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at     TIMESTAMPTZ  DEFAULT NOW()
 );
 
+-- ── human takeovers ──────────────────────────
+-- Conversaciones donde el dentista ha tomado control y el bot está pausado.
+CREATE TABLE IF NOT EXISTS human_takeovers (
+    clinic_id      VARCHAR(50)  NOT NULL REFERENCES clinics(id) ON DELETE CASCADE,
+    patient_phone  VARCHAR(20)  NOT NULL,
+    enabled        BOOLEAN      NOT NULL DEFAULT true,
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (clinic_id, patient_phone)
+);
+
 -- ── quotes ───────────────────────────────────
 CREATE TABLE IF NOT EXISTS quotes (
     id             SERIAL       PRIMARY KEY,

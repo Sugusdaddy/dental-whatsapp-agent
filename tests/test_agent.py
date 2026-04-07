@@ -123,9 +123,13 @@ class TestDatabase:
 
     def test_patient_appointments_after_cancel(self):
         """Citas canceladas no deben aparecer en upcoming."""
-        self.db.cancel_appointment("apt_001")
-        apts = self.db.get_patient_appointments("clinic_001", "+34612345678")
-        assert len(apts) == 0
+        # Cuántas citas activas tiene María antes de cancelar una
+        before = self.db.get_patient_appointments("clinic_001", "+34612345678")
+        target_id = before[0].appointment_id
+        self.db.cancel_appointment(target_id)
+        after = self.db.get_patient_appointments("clinic_001", "+34612345678")
+        assert len(after) == len(before) - 1
+        assert all(a.appointment_id != target_id for a in after)
 
     def test_create_appointment_parses_slot(self):
         apt = self.db.create_appointment(

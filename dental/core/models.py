@@ -79,6 +79,7 @@ class Patient(BaseModel):
     name:         Optional[str] = None
     email:        Optional[str] = None
     last_visit:   Optional[datetime] = None
+    last_contact: Optional[datetime] = None  # último mensaje recibido vía WhatsApp
 
     @field_validator("phone")
     @classmethod

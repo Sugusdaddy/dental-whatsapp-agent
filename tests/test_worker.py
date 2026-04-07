@@ -39,6 +39,7 @@ class TestCeleryTasks:
         mock_clinic.phone = "+34911234567"
         mock_db = MagicMock()
         mock_db.get_clinic.return_value = mock_clinic
+        mock_db.is_human_takeover.return_value = False
         mock_get_db.return_value = mock_db
         
         mock_process.return_value = "Hola, ¿en qué puedo ayudarte?"

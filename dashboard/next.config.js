@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
+  // Removed 'standalone' to make 'next start' work properly
 }
 
 module.exports = nextConfig
