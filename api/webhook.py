@@ -2,6 +2,10 @@
 Webhook FastAPI — recibe mensajes de WhatsApp (360dialog / Cloud API)
 y los procesa con el agente.
 
+Modos de operación:
+- ASYNC_MODE=true  → Encola en Celery, responde HTTP 200 inmediato
+- ASYNC_MODE=false → Procesa síncronamente (desarrollo)
+
 Endpoints:
   GET  /health
   GET  /webhook/{clinic_id}   — verificación inicial de 360dialog
@@ -25,7 +29,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from dental.core.agent import process_message
 from dental.core.database import get_db
 from dental.core.whatsapp_client import get_whatsapp_client, send_whatsapp
 
@@ -48,6 +51,7 @@ app.add_middleware(
 )
 
 WEBHOOK_SECRET = os.getenv("WHATSAPP_WEBHOOK_SECRET", "dev_secret_changeme")
+ASYNC_MODE = os.getenv("ASYNC_MODE", "false").lower() == "true"
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 
@@ -100,13 +104,26 @@ def parse_whatsapp_payload(payload: dict) -> Optional[dict]:
 
 @app.get("/health")
 async def health():
-    db     = get_db()
+    db = get_db()
     clinic = db.get_clinic("clinic_001")
     whatsapp = get_whatsapp_client()
+    
+    # Check Redis/Celery si está en modo async
+    celery_status = "disabled"
+    if ASYNC_MODE:
+        try:
+            from dental.core.worker import celery_app
+            celery_app.control.ping(timeout=1)
+            celery_status = "ok"
+        except Exception:
+            celery_status = "error"
+    
     return {
         "status": "ok",
-        "db":     "ok" if clinic else "sin_datos",
+        "db": "ok" if clinic else "sin_datos",
         "whatsapp": "configured" if whatsapp.is_configured else "dev_mode",
+        "async_mode": ASYNC_MODE,
+        "celery": celery_status,
         "clinic_demo": clinic.name if clinic else None,
     }
 
@@ -142,9 +159,16 @@ async def receive_message(
 ):
     """
     Recibe mensajes de WhatsApp para una clínica.
-    Valida la firma, parsea el payload, llama al agente y envía respuesta.
+    
+    Si ASYNC_MODE=true:
+      - Encola en Celery
+      - Responde HTTP 200 inmediatamente
+      
+    Si ASYNC_MODE=false:
+      - Procesa síncronamente
+      - Envía respuesta por WhatsApp
     """
-    body    = await request.body()
+    body = await request.body()
     payload = {}
 
     # Parsear JSON
@@ -160,7 +184,7 @@ async def receive_message(
         raise HTTPException(status_code=401, detail="Firma inválida")
 
     # Verificar que la clínica existe
-    db     = get_db()
+    db = get_db()
     clinic = db.get_clinic(clinic_id)
     if not clinic:
         raise HTTPException(status_code=404, detail=f"Clínica {clinic_id} no encontrada")
@@ -177,17 +201,43 @@ async def receive_message(
     whatsapp = get_whatsapp_client()
     await whatsapp.mark_as_read(msg["message_id"])
 
-    # Procesar con el agente
+    # ═══════════════════════════════════════════
+    # MODO ASYNC: Encolar en Celery
+    # ═══════════════════════════════════════════
+    if ASYNC_MODE:
+        from dental.core.worker import process_whatsapp_message
+        
+        task = process_whatsapp_message.delay(
+            clinic_id=clinic_id,
+            patient_phone=msg["phone"],
+            message_text=msg["text"],
+            patient_name=msg.get("name"),
+            message_id=msg["message_id"],
+        )
+        
+        logger.info(f"[{clinic_id}] Mensaje encolado: task_id={task.id}")
+        
+        return JSONResponse({
+            "status": "queued",
+            "task_id": task.id,
+            "clinic_id": clinic_id,
+            "patient_phone": msg["phone"],
+        })
+
+    # ═══════════════════════════════════════════
+    # MODO SYNC: Procesar directamente
+    # ═══════════════════════════════════════════
+    from dental.core.agent import process_message
+    
     try:
         response_text = process_message(
-            patient_phone = msg["phone"],
-            message_text  = msg["text"],
-            clinic_id     = clinic_id,
-            patient_name  = msg.get("name"),
+            patient_phone=msg["phone"],
+            message_text=msg["text"],
+            clinic_id=clinic_id,
+            patient_name=msg.get("name"),
         )
     except Exception as e:
         logger.error(f"Error en agente: {e}", exc_info=True)
-        # Respuesta de fallback — nunca dejar al paciente sin respuesta
         response_text = (
             "Lo siento, ha ocurrido un error técnico. "
             f"Por favor llama directamente a la clínica: {clinic.phone}"
@@ -201,11 +251,11 @@ async def receive_message(
     )
 
     return JSONResponse({
-        "status":         "processed",
-        "clinic_id":      clinic_id,
-        "patient_phone":  msg["phone"],
-        "response":       response_text,
-        "whatsapp_sent":  send_result,
+        "status": "processed",
+        "clinic_id": clinic_id,
+        "patient_phone": msg["phone"],
+        "response": response_text,
+        "whatsapp_sent": send_result,
     })
 
 
@@ -222,7 +272,6 @@ async def get_clinic_stats(clinic_id: str):
         raise HTTPException(status_code=404, detail="Clínica no encontrada")
 
     now = datetime.now(MADRID_TZ)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     # Obtener citas de hoy
     all_apts = [
@@ -248,17 +297,13 @@ async def get_clinic_stats(clinic_id: str):
 
 @app.get("/api/conversations/{clinic_id}")
 async def get_conversations(clinic_id: str, limit: int = 20):
-    """
-    Lista de conversaciones recientes para el dashboard.
-    En producción: consultar tabla de mensajes en PostgreSQL.
-    """
+    """Lista de conversaciones recientes para el dashboard."""
     db = get_db()
     clinic = db.get_clinic(clinic_id)
     if not clinic:
         raise HTTPException(status_code=404, detail="Clínica no encontrada")
 
     # Por ahora devolver pacientes con citas recientes
-    # En producción: tabla conversations con mensajes
     recent_apts = sorted(
         [a for a in db._appointments.values() if a.clinic_id == clinic_id],
         key=lambda x: x.appointment_datetime,
@@ -276,7 +321,7 @@ async def get_conversations(clinic_id: str, limit: int = 20):
                 "name": apt.patient_name or (patient.name if patient else "Paciente"),
                 "last_appointment": apt.appointment_datetime.isoformat(),
                 "status": apt.status.value,
-                "human_takeover": False,  # En producción: flag en DB
+                "human_takeover": False,
             })
 
     return {"clinic_id": clinic_id, "conversations": conversations}
@@ -284,16 +329,13 @@ async def get_conversations(clinic_id: str, limit: int = 20):
 
 @app.post("/api/conversations/{clinic_id}/{phone}/takeover")
 async def takeover_conversation(clinic_id: str, phone: str):
-    """
-    El dentista toma control de una conversación.
-    El agente deja de responder automáticamente a ese thread.
-    """
+    """El dentista toma control de una conversación."""
     db = get_db()
     clinic = db.get_clinic(clinic_id)
     if not clinic:
         raise HTTPException(status_code=404, detail="Clínica no encontrada")
 
-    # En producción: actualizar flag human_takeover en tabla conversations
+    # TODO: Guardar flag en DB
     logger.info(f"[{clinic_id}] Takeover de conversación con {phone}")
 
     return {
@@ -319,6 +361,26 @@ async def release_conversation(clinic_id: str, phone: str):
         "clinic_id": clinic_id,
         "phone": phone,
         "message": "El agente volverá a responder automáticamente.",
+    }
+
+
+# ─────────────────────────────────────────────
+# CELERY TASK STATUS
+# ─────────────────────────────────────────────
+
+@app.get("/api/task/{task_id}")
+async def get_task_status(task_id: str):
+    """Consulta el estado de una tarea de Celery."""
+    if not ASYNC_MODE:
+        raise HTTPException(status_code=400, detail="Async mode not enabled")
+    
+    from dental.core.worker import celery_app
+    result = celery_app.AsyncResult(task_id)
+    
+    return {
+        "task_id": task_id,
+        "status": result.status,
+        "result": result.result if result.ready() else None,
     }
 
 
